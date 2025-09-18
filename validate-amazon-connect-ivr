@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Amazon Connect IVR Validator</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 2rem;
+      background: #f9fafb;
+      color: #111;
+    }
+    h1 {
+      font-size: 1.8rem;
+      margin-bottom: 0.5rem;
+    }
+    p.lead {
+      font-size: 1.1rem;
+      margin-bottom: 1rem;
+    }
+    textarea {
+      width: 100%;
+      height: 200px;
+      margin-bottom: 1rem;
+      padding: 0.5rem;
+      font-family: monospace;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+    }
+    .controls {
+      margin-bottom: 1rem;
+    }
+    .report {
+      white-space: pre-wrap;
+      background: #fff;
+      border: 1px solid #ddd;
+      padding: 1rem;
+      border-radius: 8px;
+      margin-top: 1rem;
+      max-height: 400px;
+      overflow-y: auto;
+    }
+    .error { color: #dc2626; }
+    .warning { color: #d97706; }
+    .info { color: #2563eb; }
+    .success { color: #15803d; }
+    input[type="file"] {
+      margin-top: 0.5rem;
+    }
+    button {
+      padding: 0.5rem 1rem;
+      border: none;
+      border-radius: 5px;
+      background-color: #2563eb;
+      color: #fff;
+      cursor: pointer;
+      font-size: 1rem;
+    }
+    button:hover {
+      background-color: #1e40af;
+    }
+    button:disabled {
+      background-color: #9ca3af;
+      cursor: not-allowed;
+    }
+    .loading::after {
+      content: "Loading...";
+      display: inline-block;
+      margin-left: 0.5rem;
+      animation: blink 1s infinite;
+    }
+    @keyframes blink {
+      50% { opacity: 0; }
+    }
+  </style>
+</head>
+<body>
+  <h1>Amazon Connect IVR Validator</h1>
+  <p class="lead">Paste or upload an exported Amazon Connect contact flow (JSON). This tool checks JSON syntax, validates module structure, detects unreachable/orphaned nodes, nodes with no outgoing edges, and flags external references (ARNs / Prompt IDs). It cannot verify resources in your AWS account — use the AWS CLI / console for that.</p>
+  <p>👉 To export a flow: in your <a href="https://console.aws.amazon.com/connect/" target="_blank">Amazon Connect console</a>, open a Contact Flow, click <strong>Save</strong> → <strong>Export</strong>. That will download a <code>.json</code> file. Paste its contents below or upload it directly.</p>
+  <p>👉 To fully validate by deployment: use <a href="https://docs.aws.amazon.com/cli/latest/reference/connect/update-contact-flow-content.html" target="_blank">AWS CLI update-contact-flow-content</a>. If AWS accepts the upload without error, your template is structurally valid.</p>
+  <p>👉 Or use any .json file to observe if validation finds any problems.</p>
+
+  <div class="controls">
+    <textarea id="jsonInput" placeholder="Paste JSON here..."></textarea>
+    <br />
+    <input type="file" id="fileInput" accept="application/json" />
+    <br /><br />
+    <button id="validateBtn" onclick="validateFlow()">Validate</button>
+  </div>
+  <div id="report" class="report"></div>
+
+  <script>
+    // Valid Amazon Connect module types
+    const VALID_MODULE_TYPES = [
+      "EntryPoint", "PlayPrompt", "GetCustomerInput", "SetAttributes", "InvokeLambdaFunction",
+      "TransferContactToQueue", "DisconnectParticipant", "SetContactAttributes", "Loop",
+      "CheckContactAttributes", "UpdateContactAttributes", "SetQueue", "TransferToFlow",
+      "StoreCustomerInput", "CallPhoneNumber", "SetVoice", "Wait"
+    ];
+
+    // ARN regex for validation
+    const ARN_REGEX = /^arn:aws:[\w-]+:[\w-]+:[0-9]{12}:[\w-\/]+$/;
+
+    function validateFlow() {
+      const reportEl = document.getElementById("report");
+      const validateBtn = document.getElementById("validateBtn");
+      let jsonText = document.getElementById("jsonInput").value.trim();
+      const fileInput = document.getElementById("fileInput");
+
+      reportEl.innerHTML = "";
+      validateBtn.disabled = true;
+      validateBtn.classList.add("loading");
+
+      if (!jsonText && fileInput.files.length === 0) {
+        reportEl.innerHTML = `<span class="error">❌ Please either paste JSON or select a file</span>`;
+        resetButton(validateBtn);
+        return;
+      }
+
+      if (fileInput.files.length > 0) {
+        const reader = new FileReader();
+        reader.onload = function (e) {
+          runValidation(e.target.result, validateBtn);
+        };
+        reader.onerror = function (e) {
+          reportEl.innerHTML = `<span class="error">❌ Error reading file: ${e.target.error}</span>`;
+          resetButton(validateBtn);
+        };
+        reader.readAsText(fileInput.files[0]);
+        return;
+      }
+
+      runValidation(jsonText, validateBtn);
+    }
+
+    function resetButton(btn) {
+      btn.disabled = false;
+      btn.classList.remove("loading");
+    }
+
+    function runValidation(text, validateBtn) {
+      const reportEl = document.getElementById("report");
+      if (!text || text.trim().length === 0) {
+        reportEl.innerHTML = `<span class="error">❌ Empty input</span>`;
+        resetButton(validateBtn);
+        return;
+      }
+
+      let flow;
+      try {
+        flow = JSON.parse(text);
+      } catch (e) {
+        reportEl.innerHTML = `<span class="error">❌ Invalid JSON: ${e.message}</span>`;
+        resetButton(validateBtn);
+        return;
+      }
+
+      const messages = [];
+
+      // Basic structure validation
+      if (!flow || typeof flow !== "object") {
+        messages.push(`<span class="error">❌ Invalid flow format - must be a JSON object</span>`);
+        reportEl.innerHTML = messages.join("\n");
+        resetButton(validateBtn);
+        return;
+      }
+
+      // Check for required properties
+      if (!flow.hasOwnProperty("modules")) {
+        messages.push(`<span class="error">❌ Flow is missing the 'modules' property</span>`);
+        reportEl.innerHTML = messages.join("\n");
+        resetButton(validateBtn);
+        return;
+      }
+
+      if (!Array.isArray(flow.modules)) {
+        messages.push(`<span class="error">❌ Flow 'modules' must be an array</span>`);
+        reportEl.innerHTML = messages.join("\n");
+        resetButton(validateBtn);
+        return;
+      }
+
+      if (!flow.hasOwnProperty("metadata")) {
+        messages.push(`<span class="warning">⚠️ Flow is missing the 'metadata' property (required for console rendering)</span>`);
+      } else if (!flow.metadata.position || typeof flow.metadata.position !== "object") {
+        messages.push(`<span class="warning">⚠️ Flow 'metadata' is missing valid 'position' data</span>`);
+      }
+
+      // Validate modules
+      const ids = new Set();
+      const duplicateIds = new Set();
+      flow.modules.forEach((m, index) => {
+        if (!m || typeof m !== "object") {
+          messages.push(`<span class="error">❌ Invalid module at index ${index} - must be an object</span>`);
+          return;
+        }
+
+        // Check required properties
+        const requiredProps = ["id", "type"];
+        requiredProps.forEach(prop => {
+          if (!m.hasOwnProperty(prop)) {
+            messages.push(`<span class="error">❌ Module at index ${index} missing required property: ${prop}</span>`);
+          }
+        });
+
+        // Check for duplicate IDs
+        if (m.id) {
+          if (ids.has(m.id)) {
+            duplicateIds.add(m.id);
+          } else {
+            ids.add(m.id);
+          }
+        }
+
+        // Validate module type
+        if (m.type && !VALID_MODULE_TYPES.includes(m.type)) {
+          messages.push(`<span class="warning">⚠️ Module ${m.id || index} has unrecognized type: ${m.type}</span>`);
+        }
+
+        // Validate branches
+        if (m.branches) {
+          if (!Array.isArray(m.branches)) {
+            messages.push(`<span class="error">❌ Module ${m.id || index} 'branches' must be an array</span>`);
+          } else {
+            m.branches.forEach((b, bIndex) => {
+              if (!b || typeof b !== "object") {
+                messages.push(`<span class="error">❌ Module ${m.id || index} has invalid branch at index ${bIndex}</span>`);
+              } else if (!b.target) {
+                messages.push(`<span class="warning">⚠️ Module ${m.id || index} has branch with no target at index ${bIndex}</span>`);
+              } else if (!ids.has(b.target)) {
+                messages.push(`<span class="warning">⚠️ Module ${m.id || index} has branch to missing target ${b.target}</span>`);
+              }
+            });
+          }
+        } else if (!["DisconnectParticipant", "TransferContactToQueue"].includes(m.type)) {
+          messages.push(`<span class="warning">⚠️ Module ${m.id || index} has no branches defined</span>`);
+        }
+
+        // Validate parameters based on module type
+        if (m.parameters && typeof m.parameters === "object") {
+          if (m.parameters.LambdaFunctionARN) {
+            if (!ARN_REGEX.test(m.parameters.LambdaFunctionARN)) {
+              messages.push(`<span class="warning">⚠️ Module ${m.id || index} has invalid Lambda ARN format: ${m.parameters.LambdaFunctionARN}</span>`);
+            } else {
+              messages.push(`<span class="info">ℹ️ Lambda ARN referenced in ${m.id || index}: ${m.parameters.LambdaFunctionARN}</span>`);
+            }
+          }
+          if (m.parameters.PromptId) {
+            messages.push(`<span class="info">ℹ️ Prompt ID referenced in ${m.id || index}: ${m.parameters.PromptId}</span>`);
+          }
+          // Example: Validate specific parameters for certain module types
+          if (m.type === "PlayPrompt" && (!m.parameters.PromptId && !m.parameters.Text)) {
+            messages.push(`<span class="error">❌ Module ${m.id || index} (PlayPrompt) requires PromptId or Text parameter</span>`);
+          }
+          if (m.type === "InvokeLambdaFunction" && !m.parameters.LambdaFunctionARN) {
+            messages.push(`<span class="error">❌ Module ${m.id || index} (InvokeLambdaFunction) requires LambdaFunctionARN parameter</span>`);
+          }
+        }
+      });
+
+      // Report duplicate IDs
+      if (duplicateIds.size > 0) {
+        messages.push(`<span class="error">❌ Duplicate module IDs found: ${[...duplicateIds].join(", ")}</span>`);
+      }
+
+      // Find EntryPoint and check for unreachable nodes
+      const startNodes = flow.modules.filter(m => m.type === "EntryPoint");
+      if (startNodes.length === 0) {
+        messages.push(`<span class="warning">⚠️ No EntryPoint node found</span>`);
+      } else if (startNodes.length > 1) {
+        messages.push(`<span class="error">❌ Multiple EntryPoint nodes found: ${startNodes.map(m => m.id).join(", ")}</span>`);
+      }
+
+      // Detect unreachable nodes using DFS
+      const reachable = new Set();
+      if (startNodes.length === 1) {
+        const stack = [startNodes[0].id];
+        while (stack.length > 0) {
+          const currentId = stack.pop();
+          if (!reachable.has(currentId)) {
+            reachable.add(currentId);
+            const module = flow.modules.find(m => m.id === currentId);
+            if (module && module.branches) {
+              module.branches.forEach(b => {
+                if (b.target && !reachable.has(b.target)) {
+                  stack.push(b.target);
+                }
+              });
+            }
+          }
+        }
+      }
+
+      const unreachable = [...ids].filter(id => !reachable.has(id));
+      if (unreachable.length > 0) {
+        messages.push(`<span class="warning">⚠️ Unreachable nodes found: ${unreachable.join(", ")}</span>`);
+      }
+
+      // Check for nodes with no outgoing edges
+      const noOutgoing = flow.modules
+        .filter(m => !["DisconnectParticipant", "TransferContactToQueue"].includes(m.type) && (!m.branches || m.branches.length === 0))
+        .map(m => m.id);
+      if (noOutgoing.length > 0) {
+        messages.push(`<span class="warning">⚠️ Nodes with no outgoing edges: ${noOutgoing.join(", ")}</span>`);
+      }
+
+      // Final message if no issues
+      if (messages.length === 0) {
+        messages.push(`<span class="success">✅ JSON valid. Basic structure looks fine.</span>`);
+      }
+
+      reportEl.innerHTML = messages.join("\n");
+      resetButton(validateBtn);
+    }
+  </script>
+</body>
+</html>
